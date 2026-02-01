@@ -83,6 +83,131 @@ class API extends CI_Controller {
 
 	}
 
+	/**
+	 * API: Update an existing QSO record
+	 * Expects JSON payload with at least: { "key": "APIKEY", "id": 123, ...fields... }
+	 */
+	function qso_update() {
+		header('Content-type: application/json');
+
+		$this->load->model('api_model');
+		$this->load->model('logbook_model');
+		$this->load->model('stations');
+		$this->load->model('club_model');
+
+		$raw = file_get_contents("php://input");
+		$raw = preg_replace('#<([eE][oO][rR])>[\r\n\t]+#', '<$1>', $raw);
+		$obj = json_decode($raw, true);
+
+		if ($obj === NULL) {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => 'wrong JSON']);
+			return;
+		}
+
+		$identifier = isset($obj['key']) ? $obj['key'] : null;
+		$this->check_rate_limit('qso_update', $identifier);
+
+		if (!isset($obj['key']) || $this->api_model->authorize($obj['key']) == 0) {
+			http_response_code(401);
+			echo json_encode(['status' => 'failed', 'reason' => 'missing or wrong api key']);
+			return;
+		}
+
+		if (!isset($obj['id']) || !is_numeric($obj['id'])) {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => 'missing qso id']);
+			return;
+		}
+
+		$userid = $this->api_model->key_userid($obj['key']);
+		$created_by = $this->api_model->key_created_by($obj['key']);
+		$club_perm = $this->club_model->get_permission_noui($userid, $created_by);
+
+		if ($userid != $created_by && ((($club_perm ?? 0) == 3) || (($club_perm ?? 0) == 6))) {
+			http_response_code(401);
+			echo json_encode(['status' => 'failed', 'reason' => 'Auth Error, not enough grants for this operation']);
+			return;
+		}
+
+		// Get QSO directly from database to bypass session-based access checks
+		// We'll validate station access separately
+		$this->db->where('COL_PRIMARY_KEY', (int)$obj['id']);
+		$this->db->limit(1);
+		$qso_query = $this->db->get($this->config->item('table_name'));
+		
+		if (!$qso_query || $qso_query->num_rows() == 0) {
+			http_response_code(404);
+			echo json_encode(['status' => 'failed', 'reason' => 'QSO not found']);
+			return;
+		}
+
+		$qso = $qso_query->row();
+		$stationId = $qso->station_id ?? null;
+
+		// Allow update if station belongs to API key user or to the key creator (club scenarios)
+		$allowed = false;
+		if ($stationId !== null) {
+			if ($this->stations->check_station_against_user($stationId, $userid)) {
+				$allowed = true;
+			}
+			if (!$allowed && $this->stations->check_station_against_user($stationId, $created_by)) {
+				$allowed = true;
+			}
+		}
+		if (!$allowed) {
+			http_response_code(401);
+			echo json_encode(['status' => 'failed', 'reason' => 'Station ID not accessible for this API key']);
+			return;
+		}
+
+		// Prepare update data from JSON input
+		// Map ADIF column names to database columns
+		$update_data = [];
+		$adif_to_db_map = [
+			'callsign' => 'COL_CALL',
+			'name' => 'COL_NAME',
+			'rst_sent' => 'COL_RST_SENT',
+			'rst_rcvd' => 'COL_RST_RCVD',
+			'time_on' => 'COL_TIME_ON',
+			'time_off' => 'COL_TIME_OFF',
+			'qso_date' => 'COL_QSO_DATE',
+			'qso_date_off' => 'COL_QSO_DATE_OFF',
+			'band' => 'COL_BAND',
+			'mode' => 'COL_MODE',
+			'comment' => 'COL_COMMENT',
+			'qsl_sent' => 'COL_QSL_SENT',
+			'qsl_rcvd' => 'COL_QSL_RCVD',
+			'lotw_qsl_sent' => 'COL_LOTW_QSL_SENT',
+			'lotw_qsl_rcvd' => 'COL_LOTW_QSL_RCVD',
+		];
+
+		// Only include fields that are in the whitelist
+		foreach ($adif_to_db_map as $json_field => $db_column) {
+			if (isset($obj[$json_field])) {
+				$update_data[$db_column] = $obj[$json_field];
+			}
+		}
+
+		// Perform the update
+		if (empty($update_data)) {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => 'No valid fields to update']);
+			return;
+		}
+
+		$this->db->where('COL_PRIMARY_KEY', (int)$obj['id']);
+		$success = $this->db->update($this->config->item('table_name'), $update_data);
+
+		if ($success) {
+			http_response_code(200);
+			echo json_encode(['status' => 'updated', 'id' => (int)$obj['id'], 'fields_updated' => count($update_data)]);
+		} else {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => 'Database update failed']);
+		}
+	}
+
 	function generate($rights) {
 		$this->load->model('user_model');
 		if(!$this->user_model->authorize(3)) { $this->session->set_flashdata('error', __("You're not allowed to do that!")); redirect('dashboard'); }
