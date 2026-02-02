@@ -518,6 +518,121 @@ class API extends CI_Controller {
 		}
 	}
 
+	/**
+	 * API: Delta sync by modification timestamp
+	 * Expects JSON payload: { "key": "APIKEY", "station_id": 1, "since": "2026-02-02 10:00:00", "limit": 20000 }
+	 * Returns ADIF lines for QSOs where `last_modified` > since
+	 */
+	function qso_sync_delta() {
+		header('Content-type: application/json');
+
+		$this->load->model('api_model');
+		$this->load->model('stations');
+
+		// Decode JSON
+		$obj = json_decode(file_get_contents("php://input"), true);
+		if ($obj === NULL) {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => "wrong JSON"]);
+			return;
+		}
+
+		// Check rate limit with API key identifier
+		$identifier = isset($obj['key']) ? $obj['key'] : null;
+		$this->check_rate_limit('qso_sync_delta', $identifier);
+
+		// Authorization
+		if(!isset($obj['key']) || $this->api_model->authorize($obj['key']) == 0) {
+			http_response_code(401);
+			echo json_encode(['status' => 'failed', 'reason' => "missing api key"]);
+			return;
+		}
+
+		// Validate required fields
+		if(!isset($obj['station_id']) || !isset($obj['since'])) {
+			http_response_code(400);
+			echo json_encode(['status' => 'failed', 'reason' => "Not all required fields were present in input JSON"]);
+			return;
+		}
+
+		$key = $obj['key'];
+		$station_id = (int)$obj['station_id'];
+		$limit = 20000;
+		if ((array_key_exists('limit',$obj)) && (is_numeric($obj['limit']*1))) {
+			$limit = $obj['limit'];
+		}
+
+		// Normalize since timestamp: accept epoch or string
+		$since_raw = $obj['since'];
+		if (is_numeric($since_raw)) {
+			$since_ts = date('Y-m-d H:i:s', (int)$since_raw);
+		} else {
+			$ts = strtotime($since_raw);
+			if ($ts === false) {
+				http_response_code(400);
+				echo json_encode(['status' => 'failed', 'reason' => "Invalid since timestamp"]);
+				return;
+			}
+			$since_ts = date('Y-m-d H:i:s', $ts);
+		}
+
+		// Check station access for key owner
+		$userid = $this->api_model->key_userid($key);
+		$station_ids = array();
+		$stations = $this->stations->all_of_user($userid);
+		foreach ($stations->result() as $row) {
+			array_push($station_ids, $row->station_id);
+		}
+		if(!in_array($station_id, $station_ids)) {
+			http_response_code(401);
+			echo json_encode(['status' => 'failed', 'reason' => "Station ID not accessible for this API key"]);
+			return;
+		}
+
+		// Load adif model & helper
+		$this->load->model('adif_data');
+		$this->load->library('AdifHelper');
+
+		$total_fetched = 0;
+		$all_qso_ids = [];
+		$lastsynced_ts = strtotime($since_ts);
+
+		$chunk_size = 5000;
+		$remaining_limit = $limit;
+		$offset = 0;
+
+		$adif_content = $this->adifhelper->getAdifHeader($this->config->item('app_name'), $this->optionslib->get_option('version'));
+
+		do {
+			$current_chunk_size = min($chunk_size, $remaining_limit);
+			$qsos = $this->adif_data->export_past_modified_chunked($station_id, $since_ts, $current_chunk_size, null, $offset, $current_chunk_size);
+
+			if ($qsos && $qsos->num_rows() > 0) {
+				foreach ($qsos->result() as $row) {
+					$adif_content .= $this->adifhelper->getAdifLine($row);
+					$all_qso_ids[] = $row->COL_PRIMARY_KEY;
+					$lm = strtotime($row->last_modified ?? $row->COL_TIME_ON);
+					if ($lm > $lastsynced_ts) { $lastsynced_ts = $lm; }
+					$total_fetched++;
+				}
+
+				$qsos->free_result();
+				$remaining_limit -= $qsos->num_rows();
+				$offset += $qsos->num_rows();
+				if ($total_fetched >= $limit) { break; }
+			}
+		} while ($qsos && $qsos->num_rows() > 0 && $total_fetched < $limit);
+
+		if ($total_fetched <= 0) {
+			http_response_code(200);
+			echo json_encode(['status' => 'successfull', 'message' => 'No new or modified QSOs available.', 'lastsynced' => $since_ts, 'exported_qsos' => 0, 'adif' => null]);
+		} else {
+			$lastsynced = date('Y-m-d H:i:s', $lastsynced_ts);
+			http_response_code(200);
+			echo json_encode(['status' => 'successfull', 'message' => 'Export successfull', 'lastsynced' => $lastsynced, 'exported_qsos' => $total_fetched, 'adif' => $adif_content]);
+		}
+	}
+
 
 	// API function to check if a callsign is in the logbook already
 	function logbook_check_callsign() {
