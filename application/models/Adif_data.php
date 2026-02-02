@@ -274,6 +274,31 @@ class adif_data extends CI_Model {
 		return $this->db->get();
 	}
 
+	/**
+	 * Export QSOs modified after a given timestamp (delta by last_modified)
+	 * Returns chunked result set ordered by last_modified ASC
+	 */
+	function export_past_modified_chunked($station_id, $since_timestamp, $limit, $onlyop = null, $offset = 0, $chunk_size = 5000) {
+		$this->db->select(''.$this->config->item('table_name').'.*, station_profile.*, dxcc_entities.name as station_country');
+		$this->db->from($this->config->item('table_name'));
+		$this->db->where($this->config->item('table_name').'.station_id', $station_id);
+		// Compare using the last_modified column
+		$this->db->where($this->config->item('table_name').".last_modified > ", $since_timestamp);
+
+		if ($onlyop) {
+			$this->db->where("upper(".$this->config->item('table_name').".col_operator)",$onlyop);
+		}
+
+		// Add chunking
+		$this->db->limit($chunk_size, $offset);
+
+		$this->db->order_by($this->config->item('table_name').".last_modified", "ASC");
+		$this->db->join('station_profile', 'station_profile.station_id = '.$this->config->item('table_name').'.station_id');
+		$this->db->join('dxcc_entities', 'station_profile.station_dxcc = dxcc_entities.adif', 'left outer');
+
+		return $this->db->get();
+	}
+
 	function export_lotw($onlyop = null) {
 		$this->load->model('stations');
 		$active_station_id = $this->stations->find_active();
